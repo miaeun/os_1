@@ -1,8 +1,16 @@
 #ifndef CAESAR_H
 #define CAESAR_H
+#include <stddef.h>
+#ifdef __cplusplus
+extern "C" {
+#endif
 
+void set_key(char key);
 
-void caesar_encrypt(const char *input_file, const char *output_file, int shift);
-void caesar_decrypt(const char *input_file, const char *output_file, int shift);
+void caesar(void* src, void* dst, int len);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

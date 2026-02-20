@@ -1,39 +1,66 @@
 CC = gcc
-CFLAGS = -fPIC -Wall -O2
-LDFLAGS = -shared
-LIB_NAME = libcaesar.so
-TARGET = caesar_program
+CFLAGS = -Wall -Wextra -pedantic -fPIC -O2
+LDFLAGS = -ldl
 
-all: $(LIB_NAME) $(TARGET)
-$(LIB_NAME): caesar.o
-	$(CC) $(LDFLAGS) -o $@ $^
+LIBNAME = libcaesar
+LIBFILE = $(LIBNAME).so
+LIB_SRC = caesar.c
+LIB_OBJ = caesar.o
 
-caesar.o: caesar.c caesar.h
-	$(CC) $(CFLAGS) -c caesar.c
+TEST = test
+TEST_SRC = test.c
+TEST_OBJ = test.o
 
-main.o: main.c
-	$(CC) -c main.c
+PREFIX = /usr/local
+LIBDIR = $(PREFIX)/lib
 
-$(TARGET): main.o
-	$(CC) -o $@ $^ -ldl
+all: $(LIBFILE)
+
+$(LIBFILE): $(LIB_OBJ)
+	$(CC) -shared -o $@ $^
+
+$(LIB_OBJ): $(LIB_SRC) caesar.h
+	$(CC) $(CFLAGS) -c $<
+
+$(TEST_OBJ): $(TEST_SRC)
+	$(CC) $(CFLAGS) -c $<
+
+test_bin: $(TEST_OBJ)
+	$(CC) -o $@ $< $(LDFLAGS)
+
+install: $(LIBFILE)
+	@echo "Installing $(LIBFILE) to $(LIBDIR)..."
+	@mkdir -p $(LIBDIR)
+	cp $(LIBFILE) $(LIBDIR)/
+	ldconfig
+	@echo "Library installed successfully"
+
+test: $(LIBFILE) test_bin input.txt
+	@echo ""
+	@echo "Running test"
+	./test_bin ./$(LIBFILE) 'X' input.txt output.enc
+	@echo ""
+	@echo "Verifying decryption"
+	./test_bin ./$(LIBFILE) 'X' output.enc output_decrypted.txt
+	@echo ""
+	@echo "Comparing original and decrypted"
+	diff input.txt output_decrypted.txt && echo "SUCCESS: Files match!" || echo "FAILED: Files differ!"
+	@echo ""
+	@echo "Contents of output files (hexdump)"
+	@echo "Original input:"
+	@hexdump -C input.txt | head -5
+	@echo "Encrypted output:"
+	@hexdump -C output.enc | head -5
+	@echo "Decrypted output:"
+	@hexdump -C output_decrypted.txt | head -5
 
 clean:
-	rm -f *.o $(LIB_NAME) $(TARGET) output.txt decrypted_output.txt
+	rm -f $(LIB_OBJ) $(LIBFILE)
+	rm -f $(TEST_OBJ) test_bin
+	rm -f output.enc output_decrypted.txt
 
-install: $(LIB_NAME)
-	sudo cp $(LIB_NAME) /usr/local/lib/
-	sudo ldconfig
+distclean: clean
+	rm -f $(LIBDIR)/$(LIBFILE)
+	ldconfig
 
-run: all
-	@echo "creatin test file..."
-	echo "hello world! I'm miaeun" > input.txt
-	@echo "startin..."
-	./$(TARGET) ./$(LIB_NAME) 3 input.txt output.txt
-	@echo "content of the file:"
-	cat input.txt
-	@echo "content of the ciphered file:"
-	cat output.txt
-	@echo "content of deciphered file:"
-	cat decrypted_output.txt
-
-.PHONY: all clean install run
+.PHONY: all install test clean distclean

@@ -1,39 +1,19 @@
 #include "caesar.h"
-#include <stdio.h>
-#include <ctype.h>
 
+static char encryption_key = 0;
 
-static void process_file(const char *input_file, const char *output_file, int shift, int mode) {
-    FILE *in = fopen(input_file, "r");
-    if (!in) {
-        printf("error: cant open input file %s\n", input_file);
-        return;
-    }
-    FILE *out = fopen(output_file, "w");
-    if (!out) {
-        printf("error: cant create output file %s\n", output_file);
-        fclose(in);
-        return;
-    }
-    int ch;
-    while ((ch = fgetc(in)) != EOF) {
-        char result = ch;
-        if (isalpha(ch)) {
-            char base = isupper(ch) ? 'A' : 'a';
-            if (mode == 1) { 
-                result = ((ch - base + shift) % 26 + 26) % 26 + base;
-            } else { 
-                result = ((ch - base - shift) % 26 + 26) % 26 + base;
-            }
-        }
-        fputc(result, out);
-    }
-    fclose(in);
-    fclose(out);
+void set_key(char key)
+{
+    encryption_key = key;
 }
-void caesar_encrypt(const char *input_file, const char *output_file, int shift) {
-    process_file(input_file, output_file, shift, 1);
-}
-void caesar_decrypt(const char *input_file, const char *output_file, int shift) {
-    process_file(input_file, output_file, shift, 0);
+
+void caesar(void* src, void* dst, int len)
+{
+    unsigned char* src_ptr = (unsigned char*)src;
+    unsigned char* dst_ptr = (unsigned char*)dst;
+    unsigned char key = (unsigned char)encryption_key;
+
+    for (int i = 0; i < len; i++) {
+        dst_ptr[i] = src_ptr[i] ^ key;
+    }
 }
