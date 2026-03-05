@@ -1,8 +1,0 @@
-Hello, World!
-This is a test file for Caesar XOR encryption.
-1234567890
-ABCDEFGHIJKLMNOPQRSTUVWXYZ
-abcdefghijklmnopqrstuvwxyz
-Special chars: !@#$%^&*()
-Numbers: 0123456789
-End of test file.
