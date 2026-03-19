@@ -1,6 +1,5 @@
-порядок запуска
-1) make
-2) dd if=/dev/urandom of=test50mb.bin bs=1M count=50
-3) ./secure_copy test50mb.bin enc.bin 5
-4) ./secure_copy enc.bin dec.bin 5
-5) sha256sum test50mb.bin dec.bin
+текстовые тестовый файлы уже добавлены
+порядок запуска, wsl
+1) make (make clean && make)
+2) ./secure_copy demo1.txt demo2.txt demo3.txt demo4.txt demo5.txt out/ 123
+3) cat log.txt
