@@ -17,7 +17,13 @@ caesar.o: caesar.c caesar.h
 clean:
 	rm -f $(OBJS) $(TARGET)
 
-run: $(TARGET)
-	./$(TARGET)
+run-sequential: $(TARGET)
+	./$(TARGET) --mode=sequential demo1.txt demo2.txt demo3.txt demo4.txt demo5.txt out/ 123
 
-.PHONY: all clean run
+run-parallel: $(TARGET)
+	./$(TARGET) --mode=parallel demo1.txt demo2.txt demo3.txt demo4.txt demo5.txt out/ 123
+
+run-auto: $(TARGET)
+	./$(TARGET) demo1.txt demo2.txt demo3.txt demo4.txt demo5.txt out/ 123
+
+.PHONY: all clean run-sequential run-parallel run-auto

@@ -14,8 +14,19 @@
 #define QUEUE_SIZE 10
 #define MAX_FILES 100
 #define TIMEOUT_SEC 5
+#define WORKERS_COUNT 4
 
 volatile sig_atomic_t keep_running = 1;
+
+// статистикс
+typedef struct {
+    double* file_times;
+    char** file_names;
+    int* file_success;
+    int count;
+    int current_idx;
+    pthread_mutex_t mutex;
+} statistics_t;
 
 typedef struct queue_node {
     unsigned char* data;
@@ -51,6 +62,7 @@ typedef struct {
     pthread_mutex_t mutex;
     FILE* log_file;
     uint8_t key;
+    statistics_t* stats;
 } job_context_t;
 
 typedef struct {
@@ -70,9 +82,16 @@ void* producer(void* arg);
 void* consumer(void* arg);
 void log_operation(job_context_t* ctx, int thread_id, const char* filename, const char* result, double elapsed_time);
 char* get_next_file(job_context_t* ctx, int thread_id);
-void increment_counter(job_context_t* ctx, int thread_id);
+void increment_counter(job_context_t* ctx);
 size_t get_file_size(FILE* f);
-void* file_processor(void* arg);
+//новые
+int copy_and_encrypt_file_simple(const char* input_path, const char* output_path, uint8_t key);
+void* worker_thread(void* arg);
+void process_sequential(job_context_t* job_ctx);
+void process_parallel(job_context_t* job_ctx);
+void print_statistics(statistics_t* stats, const char* mode_name, double real_time);
+void print_comparison(statistics_t* stats1, const char* name1, double time1, 
+                      statistics_t* stats2, const char* name2, double time2);
 
 void queue_init(queue_t* q, int max_size)
 {
@@ -206,11 +225,9 @@ void print_progress(size_t done, size_t total)
     static struct timespec last = {0};
     struct timespec now;
     clock_gettime(CLOCK_MONOTONIC, &now);
-    long diff = 
-        (now.tv_sec - last.tv_sec) * 1000 + 
-        (now.tv_nsec - last.tv_nsec) / 1000000;
-    if (diff < 100)
-     return;
+    long diff = (now.tv_sec - last.tv_sec) * 1000 + 
+                (now.tv_nsec - last.tv_nsec) / 1000000;
+    if (diff < 100) return;
     last = now;
     size_t percent = (done * 100) / total;
     int bars = percent / 10;
@@ -229,17 +246,14 @@ void* producer(void* arg)
     while (keep_running) {
         size_t bytes = fread(temp, 1, BUFFER_SIZE, ctx->fin);
         if (bytes == 0) {
-            if (feof(ctx->fin)) 
-                break;
+            if (feof(ctx->fin)) break;
             perror("read error");
             keep_running = 0;
             break;
         }
         caesar(temp, encrypted, bytes);
-        if (queue_push(ctx->queue, encrypted, bytes) != 0) 
-            break;
-        if (bytes < BUFFER_SIZE) 
-            break;
+        if (queue_push(ctx->queue, encrypted, bytes) != 0) break;
+        if (bytes < BUFFER_SIZE) break;
     }
     queue_finish(ctx->queue);
     return NULL;
@@ -251,8 +265,7 @@ void* consumer(void* arg)
     unsigned char buffer[BUFFER_SIZE];
     size_t bytes;
     while (keep_running) {
-        if (queue_pop(ctx->queue, buffer, &bytes) != 0) 
-            break;
+        if (queue_pop(ctx->queue, buffer, &bytes) != 0) break;
         if (fwrite(buffer, 1, bytes, ctx->fout) != bytes) {
             perror("write error");
             keep_running = 0;
@@ -264,21 +277,42 @@ void* consumer(void* arg)
     return NULL;
 }
 
+// копи и шифр файла 
+int copy_and_encrypt_file_simple(const char* input_path, const char* output_path, uint8_t key)
+{
+    FILE* fin = fopen(input_path, "rb");
+    if (!fin) return -1;
+    
+    FILE* fout = fopen(output_path, "wb");
+    if (!fout) {
+        fclose(fin);
+        return -1;
+    }
+    
+    unsigned char buffer[BUFFER_SIZE];
+    unsigned char encrypted[BUFFER_SIZE];
+    size_t bytes;
+    int result = 0;
+    
+    while ((bytes = fread(buffer, 1, BUFFER_SIZE, fin)) > 0) {
+        caesar(buffer, encrypted, bytes);
+        if (fwrite(encrypted, 1, bytes, fout) != bytes) {
+            result = -1;
+            break;
+        }
+    }
+    
+    fclose(fin);
+    fclose(fout);
+    return result;
+}
+
 void log_operation(job_context_t* ctx, int thread_id, const char* filename, 
-                   const char* result, double elapsed_time) // логирование операции с файлом
+                   const char* result, double elapsed_time)
 {
     if (!ctx->log_file) return;
     
-    struct timespec timeout;
-    clock_gettime(CLOCK_REALTIME, &timeout);
-    timeout.tv_sec += TIMEOUT_SEC;
-    
-    int lock_result = pthread_mutex_timedlock(&ctx->mutex, &timeout);
-    if (lock_result == ETIMEDOUT) {
-        fprintf(stderr, "возможная взаимоблокировка: поток %d ожидает мьютекс более %d секунд\n", 
-                thread_id, TIMEOUT_SEC);
-        return;
-    }
+    pthread_mutex_lock(&ctx->mutex);
     
     time_t rawtime;
     struct tm* timeinfo;
@@ -288,7 +322,7 @@ void log_operation(job_context_t* ctx, int thread_id, const char* filename,
     strftime(time_buffer, sizeof(time_buffer), "%Y-%m-%d %H:%M:%S", timeinfo);
     
     fprintf(ctx->log_file, "[%s] Поток %d **** Файл: %s **** Результат: %s **** Время: %.3f сек\n",
-            time_buffer, thread_id, filename, result, elapsed_time); //запись в лог
+            time_buffer, thread_id, filename, result, elapsed_time);
     fflush(ctx->log_file);
     
     pthread_mutex_unlock(&ctx->mutex);
@@ -296,16 +330,7 @@ void log_operation(job_context_t* ctx, int thread_id, const char* filename,
 
 char* get_next_file(job_context_t* ctx, int thread_id)
 {
-    struct timespec timeout;
-    clock_gettime(CLOCK_REALTIME, &timeout);
-    timeout.tv_sec += TIMEOUT_SEC;
-    
-    int lock_result = pthread_mutex_timedlock(&ctx->mutex, &timeout);
-    if (lock_result == ETIMEDOUT) {
-        fprintf(stderr, "возможная взаимоблокировка: поток %d ожидает мьютекс более %d секунд\n", 
-                thread_id, TIMEOUT_SEC);
-        return NULL;
-    }
+    pthread_mutex_lock(&ctx->mutex);
     
     if (ctx->current_index >= ctx->file_count) {
         pthread_mutex_unlock(&ctx->mutex);
@@ -319,25 +344,15 @@ char* get_next_file(job_context_t* ctx, int thread_id)
     return filename;
 }
 
-void increment_counter(job_context_t* ctx, int thread_id)
+void increment_counter(job_context_t* ctx)
 {
-    struct timespec timeout;
-    clock_gettime(CLOCK_REALTIME, &timeout);
-    timeout.tv_sec += TIMEOUT_SEC;
-    
-    int lock_result = pthread_mutex_timedlock(&ctx->mutex, &timeout);
-    if (lock_result == ETIMEDOUT) {
-        fprintf(stderr, "возможная взаимоблокировка: поток %d ожидает мьютекс более %d секунд\n", 
-                thread_id, TIMEOUT_SEC);
-        return;
-    }
-    
+    pthread_mutex_lock(&ctx->mutex);
     ctx->completed_count++;
-    
     pthread_mutex_unlock(&ctx->mutex);
 }
 
-void* file_processor(void* arg)
+// рабочий поток
+void* worker_thread(void* arg)
 {
     thread_context_t* tctx = (thread_context_t*)arg;
     job_context_t* job_ctx = tctx->job_ctx;
@@ -361,59 +376,162 @@ void* file_processor(void* arg)
         struct timespec start, end;
         clock_gettime(CLOCK_MONOTONIC, &start);
         
-        FILE* fin = fopen(input_path, "rb");
-        if (!fin) {
-            clock_gettime(CLOCK_MONOTONIC, &end);
-            double elapsed = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
-            log_operation(job_ctx, thread_id, filename, "ОШИБКА (открытие входа)", elapsed);
-            continue;
-        }
+        int success = (copy_and_encrypt_file_simple(input_path, output_path, job_ctx->key) == 0);
         
-        FILE* fout = fopen(output_path, "wb");
-        if (!fout) {
-            clock_gettime(CLOCK_MONOTONIC, &end);
-            double elapsed = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
-            log_operation(job_ctx, thread_id, filename, "ОШИБКА (открытие выхода)", elapsed);
-            fclose(fin);
-            continue;
-        }
-        
-        size_t total_size = get_file_size(fin);
-        
-        queue_t queue;
-        queue_init(&queue, QUEUE_SIZE);
-        
-        context_t ctx = {
-            .fin = fin,
-            .fout = fout,
-            .queue = &queue,
-            .total_size = total_size,
-            .processed = 0
-        };
-        
-        pthread_t producer_thread;
-        pthread_t consumer_thread;
-        
-        pthread_create(&producer_thread,NULL,producer,&ctx);
-        pthread_create(&consumer_thread,NULL,consumer,&ctx);
-        pthread_join(producer_thread,NULL);
-        pthread_join(consumer_thread,NULL);
-        queue_destroy(&queue);
-        fclose(fin);
-        fclose(fout);
-        increment_counter(job_ctx, thread_id);
         clock_gettime(CLOCK_MONOTONIC, &end);
         double elapsed = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
-        log_operation(job_ctx, thread_id, filename, "УСПЕХ", elapsed);
+        
+        // стата
+        pthread_mutex_lock(&job_ctx->stats->mutex);
+        int idx = job_ctx->stats->current_idx++;
+        if (idx < job_ctx->stats->count) {
+            job_ctx->stats->file_times[idx] = elapsed;
+            job_ctx->stats->file_success[idx] = success ? 1 : 0;
+            job_ctx->stats->file_names[idx] = strdup(base_name);
+        }
+        pthread_mutex_unlock(&job_ctx->stats->mutex);
+        
+        printf("[Поток %d] [%d/%d] %s: %.3f сек %s\n", 
+               thread_id, job_ctx->completed_count + 1, job_ctx->file_count, 
+               base_name, elapsed, success ? "+" : "-");
+        
+        log_operation(job_ctx, thread_id, filename, success ? "УСПЕХ" : "ОШИБКА", elapsed);
+        increment_counter(job_ctx);
     }
     
     return NULL;
 }
 
+// последовательный
+void process_sequential(job_context_t* job_ctx)
+{
+    printf("\nПОСЛЕДОВАТЕЛЬНЫЙ РЕЖИМ\n");
+    
+    for (int i = 0; i < job_ctx->file_count; i++) {
+        char* filename = job_ctx->input_files[i];
+        char output_path[256];
+        const char* base_name = strrchr(filename, '/');
+        if (base_name == NULL) base_name = filename;
+        else base_name++;
+        snprintf(output_path, sizeof(output_path), "%s/%s", job_ctx->output_dir, base_name);
+        
+        struct timespec start, end;
+        clock_gettime(CLOCK_MONOTONIC, &start);
+        
+        int success = (copy_and_encrypt_file_simple(filename, output_path, job_ctx->key) == 0);
+        
+        clock_gettime(CLOCK_MONOTONIC, &end);
+        double elapsed = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
+        
+        // save
+        pthread_mutex_lock(&job_ctx->stats->mutex);
+        job_ctx->stats->file_times[i] = elapsed;
+        job_ctx->stats->file_success[i] = success ? 1 : 0;
+        job_ctx->stats->file_names[i] = strdup(base_name);
+        pthread_mutex_unlock(&job_ctx->stats->mutex);
+        
+        printf("[%d/%d] %s: %.3f сек %s\n", i+1, job_ctx->file_count, base_name, elapsed, success ? "+" : "-");
+        
+        log_operation(job_ctx, 0, filename, success ? "УСПЕХ" : "ОШИБКА", elapsed);
+        job_ctx->completed_count++;
+    }
+}
+
+// параллельный
+void process_parallel(job_context_t* job_ctx)
+{
+    printf("\nПАРАЛЛЕЛЬНЫЙ РЕЖИМ (%d threads)\n", WORKERS_COUNT);
+    
+    pthread_t workers[WORKERS_COUNT];
+    thread_context_t tctx[WORKERS_COUNT];
+    
+    job_ctx->current_index = 0;
+    job_ctx->completed_count = 0;
+    
+    // пул (1)
+    for (int i = 0; i < WORKERS_COUNT; i++) {
+        tctx[i].job_ctx = job_ctx;
+        tctx[i].thread_id = i + 1;
+        pthread_create(&workers[i], NULL, worker_thread, &tctx[i]);
+    }
+    
+    // завершение
+    for (int i = 0; i < WORKERS_COUNT; i++) {
+        pthread_join(workers[i], NULL);
+    }
+}
+
+void print_statistics(statistics_t* stats, const char* mode_name, double real_time)
+{
+    double total_time = 0;
+    int success_count = 0;
+    
+    for (int i = 0; i < stats->count; i++) {
+        if (stats->file_success[i]) {
+            total_time += stats->file_times[i];
+            success_count++;
+        }
+    }
+    
+    double avg_time = (success_count > 0) ? total_time / success_count : 0;
+    
+    printf("СТАТИСТИКА (%s)\n", mode_name);
+    printf("Общее время:               %10.3f сек\n", total_time);
+    printf("Реальное время выполнения: %10.3f сек\n", real_time);
+    printf("Среднее время на файл:     %10.3f сек\n", avg_time);
+    printf("Обработано файлов:         %10d\n", stats->count);
+    printf("Успешно:                   %10d\n", success_count);
+}
+
+void print_comparison(statistics_t* stats1, const char* name1, double time1,
+                      statistics_t* stats2, const char* name2, double time2)
+{
+    double total1 = 0, total2 = 0;
+    for (int i = 0; i < stats1->count; i++) {
+        if (stats1->file_success[i]) total1 += stats1->file_times[i];
+    }
+    for (int i = 0; i < stats2->count; i++) {
+        if (stats2->file_success[i]) total2 += stats2->file_times[i];
+    }
+    
+    printf("СРАВНИТЕЛЬНАЯ ТАБЛИЦА\n");
+    printf("│ Режим            │ Время (сек)   │ Среднее (сек)  │\n");
+    
+    double avg1 = (stats1->count > 0) ? total1 / stats1->count : 0;
+    double avg2 = (stats2->count > 0) ? total2 / stats2->count : 0;
+    
+    printf("│ %-16s │ %13.3f │ %14.3f │\n", name1, time1, avg1);
+    printf("│ %-16s │ %13.3f │ %14.3f │\n", name2, time2, avg2);
+    
+    if (time2 > 0) {
+        double speedup = time1 / time2;
+        printf("Ускорение: %s быстрее %s в %.2f раза\n", 
+               (speedup > 1) ? name2 : name1,
+               (speedup > 1) ? name1 : name2,
+               (speedup > 1) ? speedup : 1.0/speedup);
+    }
+}
+
 int main(int argc, char* argv[])
 {
-    if (argc < 4) {
-        fprintf(stderr, "Usage: %s file1.txt file2.txt ... output_dir/ key\n", argv[0]);
+    int mode = -1;  // -1: auto, 0: seq, 1: parallel
+    int file_start_index = 1;
+    
+    // parsin --mode 
+    if (argc > 1 && strncmp(argv[1], "--mode=", 7) == 0) {
+        if (strcmp(argv[1] + 7, "sequential") == 0) {
+            mode = 0;
+        } else if (strcmp(argv[1] + 7, "parallel") == 0) {
+            mode = 1;
+        } else {
+            fprintf(stderr, "unknown mode, use --mode=sequential or --mode=parallel\n");
+            return 1;
+        }
+        file_start_index = 2;
+    }
+    
+    if (argc - file_start_index < 3) {
+        fprintf(stderr, "Usage: %s [--mode=sequential|parallel] file1 file2 ... output_dir key\n", argv[0]);
         return 1;
     }
     
@@ -424,7 +542,7 @@ int main(int argc, char* argv[])
     }
     
     char* output_dir = argv[argc - 2];
-    int file_count = argc - 3;
+    int file_count = argc - file_start_index - 2;
     
     if (file_count < 1) {
         fprintf(stderr, "Need at least one input file\n");
@@ -439,40 +557,73 @@ int main(int argc, char* argv[])
     set_key((unsigned char)key);
     signal(SIGINT, handle_sigint);
     
+    // auto
+    if (mode == -1) {
+        if (file_count < 5) {
+            mode = 0;
+            printf("\nauto: sequential\n");
+            printf("(файлов: %d < 5)\n", file_count);
+        } else {
+            mode = 1;
+            printf("\nauto: parallel\n");
+            printf("(файлов: %d >= 5)\n", file_count);
+        }
+    }
+    
     FILE* log_file = fopen("log.txt", "a");
     if (!log_file) {
         perror("Cannot open log.txt");
         return 1;
     }
     
+    // stat initializing
+    statistics_t selected_stats;
+    selected_stats.count = file_count;
+    selected_stats.current_idx = 0;
+    selected_stats.file_times = malloc(file_count * sizeof(double));
+    selected_stats.file_names = malloc(file_count * sizeof(char*));
+    selected_stats.file_success = malloc(file_count * sizeof(int));
+    pthread_mutex_init(&selected_stats.mutex, NULL);
+    
     job_context_t job_ctx;
     job_ctx.output_dir = output_dir;
     job_ctx.file_count = file_count;
     job_ctx.current_index = 0;
     job_ctx.completed_count = 0;
-    job_ctx.key = key;
+    job_ctx.key = (uint8_t)key;
     job_ctx.log_file = log_file;
+    job_ctx.stats = &selected_stats;
     
     for (int i = 0; i < file_count; i++) {
-        job_ctx.input_files[i] = argv[i + 1];
+        job_ctx.input_files[i] = argv[file_start_index + i];
     }
     
     pthread_mutex_init(&job_ctx.mutex, NULL);
     
-    pthread_t threads[3];
-    thread_context_t tctx[3];
+    struct timespec total_start, total_end;
+    clock_gettime(CLOCK_MONOTONIC, &total_start);
     
-    for (int i = 0; i < 3; i++) {
-        tctx[i].job_ctx = &job_ctx;
-        tctx[i].thread_id = i + 1;
-        pthread_create(&threads[i], NULL, file_processor, &tctx[i]);
+    if (mode == 0) {
+        process_sequential(&job_ctx);
+    } else {
+        process_parallel(&job_ctx);
     }
     
-    for (int i = 0; i < 3; i++) {
-        pthread_join(threads[i], NULL);
-    }
+    clock_gettime(CLOCK_MONOTONIC, &total_end);
+    double total_elapsed = (total_end.tv_sec - total_start.tv_sec) + 
+                           (total_end.tv_nsec - total_start.tv_nsec) / 1e9;
     
-    printf("\nобработано файлов: %d из %d\n", job_ctx.completed_count, file_count);
+    printf("\n");
+    print_statistics(&selected_stats, mode == 0 ? "sequential" : "parallel", total_elapsed);
+    
+    // cleanup
+    for (int i = 0; i < selected_stats.count; i++) {
+        if (selected_stats.file_names[i]) free(selected_stats.file_names[i]);
+    }
+    free(selected_stats.file_times);
+    free(selected_stats.file_names);
+    free(selected_stats.file_success);
+    pthread_mutex_destroy(&selected_stats.mutex);
     
     pthread_mutex_destroy(&job_ctx.mutex);
     fclose(log_file);
