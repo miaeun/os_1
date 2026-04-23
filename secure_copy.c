@@ -554,21 +554,117 @@ int main(int argc, char* argv[])
         return 1;
     }
     
-    //sequential
-    printf("\n Running SEQUENTIAL mode \n");
-    
     statistics_t seq_stats;
+    statistics_t par_stats;
+    
     seq_stats.count = file_count;
     seq_stats.current_idx = 0;
     seq_stats.file_times = malloc(file_count * sizeof(double));
     seq_stats.file_names = malloc(file_count * sizeof(char*));
     seq_stats.file_success = malloc(file_count * sizeof(int));
-    if (!seq_stats.file_times || !seq_stats.file_names || !seq_stats.file_success) {
+    
+    par_stats.count = file_count;
+    par_stats.current_idx = 0;
+    par_stats.file_times = malloc(file_count * sizeof(double));
+    par_stats.file_names = malloc(file_count * sizeof(char*));
+    par_stats.file_success = malloc(file_count * sizeof(int));
+    
+    if (!seq_stats.file_times || !seq_stats.file_names || !seq_stats.file_success ||
+        !par_stats.file_times || !par_stats.file_names || !par_stats.file_success) {
         perror("malloc failed");
         fclose(log_file);
         return 1;
     }
+    
     pthread_mutex_init(&seq_stats.mutex, NULL);
+    pthread_mutex_init(&par_stats.mutex, NULL);
+    
+    if (is_auto) {
+        printf("\nwarm-up\n");
+        
+        char warm_dir[] = "/tmp/caesar_warmup_XXXXXX";
+        if (mkdtemp(warm_dir)) {
+            job_context_t warm_seq;
+            warm_seq.output_dir = warm_dir;
+            warm_seq.file_count = file_count;
+            warm_seq.current_index = 0;
+            warm_seq.completed_count = 0;
+            warm_seq.key = (uint8_t)key;
+            warm_seq.log_file = fopen("/dev/null", "w");
+            warm_seq.stats = NULL;
+            
+            for (int i = 0; i < file_count; i++) {
+                warm_seq.input_files[i] = argv[file_start_index + i];
+            }
+            pthread_mutex_init(&warm_seq.mutex, NULL);
+            
+            process_sequential(&warm_seq);
+            
+            for (int i = 0; i < file_count; i++) {
+                char path[512];
+                const char* base_name = strrchr(argv[file_start_index + i], '/');
+                if (base_name == NULL) base_name = argv[file_start_index + i];
+                else base_name++;
+                snprintf(path, sizeof(path), "%s/%s", warm_dir, base_name);
+                unlink(path);
+            }
+            
+            job_context_t warm_par;
+            warm_par.output_dir = warm_dir;
+            warm_par.file_count = file_count;
+            warm_par.current_index = 0;
+            warm_par.completed_count = 0;
+            warm_par.key = (uint8_t)key;
+            warm_par.log_file = fopen("/dev/null", "w");
+            warm_par.stats = NULL;
+            
+            for (int i = 0; i < file_count; i++) {
+                warm_par.input_files[i] = argv[file_start_index + i];
+            }
+            pthread_mutex_init(&warm_par.mutex, NULL);
+            
+            process_parallel(&warm_par);
+            
+            for (int i = 0; i < file_count; i++) {
+                char path[512];
+                const char* base_name = strrchr(argv[file_start_index + i], '/');
+                if (base_name == NULL) base_name = argv[file_start_index + i];
+                else base_name++;
+                snprintf(path, sizeof(path), "%s/%s", warm_dir, base_name);
+                unlink(path);
+            }
+            
+            rmdir(warm_dir);
+            
+            if (warm_seq.log_file) fclose(warm_seq.log_file);
+            if (warm_par.log_file) fclose(warm_par.log_file);
+            pthread_mutex_destroy(&warm_seq.mutex);
+            pthread_mutex_destroy(&warm_par.mutex);
+            
+            printf("Warm-up complete. Starting real measurements...\n");
+        } else {
+            printf("Warning: Could not create warmup directory, continuing without warmup\n");
+        }
+        
+        seq_stats.current_idx = 0;
+        par_stats.current_idx = 0;
+        for (int i = 0; i < file_count; i++) {
+            seq_stats.file_times[i] = 0;
+            seq_stats.file_success[i] = 0;
+            if (seq_stats.file_names[i]) {
+                free(seq_stats.file_names[i]);
+                seq_stats.file_names[i] = NULL;
+            }
+            par_stats.file_times[i] = 0;
+            par_stats.file_success[i] = 0;
+            if (par_stats.file_names[i]) {
+                free(par_stats.file_names[i]);
+                par_stats.file_names[i] = NULL;
+            }
+        }
+    }
+    
+    printf("\nSEQUENTIAL\n");
     
     char seq_output_dir[256];
     snprintf(seq_output_dir, sizeof(seq_output_dir), "%s_seq", output_dir);
@@ -599,28 +695,7 @@ int main(int argc, char* argv[])
     
     print_statistics(&seq_stats, "sequential", seq_elapsed);
     
-    //parallel
-    printf("\n Running PARALLEL mode \n");
-    
-    statistics_t par_stats;
-    par_stats.count = file_count;
-    par_stats.current_idx = 0;
-    par_stats.file_times = malloc(file_count * sizeof(double));
-    par_stats.file_names = malloc(file_count * sizeof(char*));
-    par_stats.file_success = malloc(file_count * sizeof(int));
-    if (!par_stats.file_times || !par_stats.file_names || !par_stats.file_success) {
-        perror("malloc failed");
-        // cleanup seq_stats
-        for (int i = 0; i < seq_stats.count; i++) {
-            if (seq_stats.file_names[i]) free(seq_stats.file_names[i]);
-        }
-        free(seq_stats.file_times);
-        free(seq_stats.file_names);
-        free(seq_stats.file_success);
-        fclose(log_file);
-        return 1;
-    }
-    pthread_mutex_init(&par_stats.mutex, NULL);
+    printf("\nPARALLEL\n");
     
     char par_output_dir[256];
     snprintf(par_output_dir, sizeof(par_output_dir), "%s_par", output_dir);
@@ -651,7 +726,7 @@ int main(int argc, char* argv[])
     
     print_statistics(&par_stats, "parallel", par_elapsed);
     
-    printf("\n COMPARISON \n");
+    printf("\nCOMPARISON\n");
     print_comparison(&seq_stats, "sequential", seq_elapsed,
                     &par_stats, "parallel", par_elapsed);
     
