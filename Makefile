@@ -1,12 +1,12 @@
 CC = gcc
-CFLAGS = -Wall -pthread -O2
+CFLAGS = -Wall -pthread -O2 -g
 TARGET = secure_copy
 OBJS = secure_copy.o caesar.o
 
 all: $(TARGET)
 
 $(TARGET): $(OBJS)
-	$(CC) $(OBJS) -o $(TARGET) $(CFLAGS)
+	$(CC) $(OBJS) -o $(TARGET) $(CFLAGS) -lm
 
 secure_copy.o: secure_copy.c caesar.h
 	$(CC) -c secure_copy.c -o secure_copy.o $(CFLAGS)
