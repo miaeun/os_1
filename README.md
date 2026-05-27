@@ -1,3 +1,5 @@
+Подробное описание программы: OPISANIE.md
+
 текстовые тестовыe файлы уже добавлены
 порядок запуска, wsl
 1) make (или make clean && make)
@@ -5,3 +7,10 @@
 3) ПАРАЛЕЛЛЬНЫЙ ./secure_copy --mode=parallel test1.txt test2.txt test3.txt test4.txt test5.txt out/ 123
 4) АВТОМАТИЧЕСКИЙ ./secure_copy test1.txt test2.txt test3.txt test4.txt test5.txt test6.txt test7.txt test8.txt test9.txt test10.txt out/ 123
 5) gdc ./secure_copy
+
+
+НОВОЕ, ДЛЯ РАБОТЫ НА СДАЧУ, СТАРОЕ УЖЕ НЕ НДАО, НО ПУСТЬ БУДЕТ
+
+6) ./secure_copy -add -key "secret" -image disk.img test1.txt in/
+7) ./secure_copy -list -image disk.img
+8) ./secure_copy -get -image disk.img -key "secret" -out result.txt test1.txt

@@ -8,7 +8,16 @@
 #include <sys/types.h>
 #include <time.h>
 #include <errno.h>
+#include <stdint.h>
+#include <dirent.h>
+#include <fcntl.h>
 #include "caesar.h"
+
+#define IMAGE_THREADS 5
+#define SALT_SIZE 16
+#define IMAGE_MAX_FILES 4096
+#define IMAGE_MAX_NAME_LEN 65536
+#define MAX_WORKERS 5
 
 #define BUFFER_SIZE 8192
 #define QUEUE_SIZE 10
@@ -54,6 +63,7 @@ typedef struct {
 
 typedef struct {
     char* input_files[MAX_FILES];
+    char* image_names[MAX_FILES];
     char* output_dir;
     int file_count;
     int current_index;
@@ -62,6 +72,9 @@ typedef struct {
     FILE* log_file;
     uint8_t key;
     statistics_t* stats;
+    FILE* image;
+    int image_errors;
+    int worker_count;
 } job_context_t;
 
 typedef struct {
@@ -90,6 +103,8 @@ void process_parallel(job_context_t* job_ctx);
 void print_statistics(statistics_t* stats, const char* mode_name, double real_time);
 void print_comparison(statistics_t* stats1, const char* name1, double time1, 
                       statistics_t* stats2, const char* name2, double time2);
+
+static int add_one_file_to_image(const char* disk_path, const char* image_name, FILE* img);
 
 void queue_init(queue_t* q, int max_size)
 {
@@ -358,6 +373,14 @@ void* worker_thread(void* arg)
     while (keep_running) {
         char* filename = get_next_file(job_ctx, thread_id);
         if (!filename) break;
+
+        if (job_ctx->image) {
+            int idx = job_ctx->current_index - 1;
+            if (add_one_file_to_image(filename, job_ctx->image_names[idx], job_ctx->image) != 0)
+                job_ctx->image_errors = 1;
+            increment_counter(job_ctx);
+            continue;
+        }
         
         char input_path[256];
         char output_path[256];
@@ -439,23 +462,27 @@ void process_sequential(job_context_t* job_ctx)
 
 void process_parallel(job_context_t* job_ctx)
 {
-    printf("\nparallel mode (%d threads)\n", WORKERS_COUNT);
+    int nw = job_ctx->worker_count > 0 ? job_ctx->worker_count : WORKERS_COUNT;
+    if (nw > MAX_WORKERS)
+        nw = MAX_WORKERS;
+
+    if (!job_ctx->image)
+        printf("\nparallel mode (%d threads)\n", nw);
     
-    pthread_t workers[WORKERS_COUNT];
-    thread_context_t tctx[WORKERS_COUNT];
+    pthread_t workers[MAX_WORKERS];
+    thread_context_t tctx[MAX_WORKERS];
     
     job_ctx->current_index = 0;
     job_ctx->completed_count = 0;
     
-    for (int i = 0; i < WORKERS_COUNT; i++) {
+    for (int i = 0; i < nw; i++) {
         tctx[i].job_ctx = job_ctx;
         tctx[i].thread_id = i + 1;
         pthread_create(&workers[i], NULL, worker_thread, &tctx[i]);
     }
     
-    for (int i = 0; i < WORKERS_COUNT; i++) {
+    for (int i = 0; i < nw; i++)
         pthread_join(workers[i], NULL);
-    }
 }
 
 void print_statistics(statistics_t* stats, const char* mode_name, double real_time)
@@ -494,8 +521,526 @@ void print_comparison(statistics_t* stats1, const char* name1, double time1,
     }
 }
 
+typedef struct {
+    char* disk_path;
+    char* image_name;
+} image_file_t;
+
+typedef struct {
+    char* name;
+    uint32_t size;
+} list_entry_t;
+
+static pthread_mutex_t image_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+static int gen_salt(uint8_t salt[SALT_SIZE])
+{
+    int fd = open("/dev/urandom", O_RDONLY);
+    if (fd < 0) {
+        perror("open /dev/urandom");
+        return -1;
+    }
+    ssize_t n = read(fd, salt, SALT_SIZE);
+    close(fd);
+    if (n != SALT_SIZE) {
+        fprintf(stderr, "cannot read salt\n");
+        return -1;
+    }
+    return 0;
+}
+
+static long image_file_remaining(FILE* img)
+{
+    long pos = ftell(img);
+    long end;
+    if (pos < 0)
+        return -1;
+    if (fseek(img, 0, SEEK_END) != 0)
+        return -1;
+    end = ftell(img);
+    if (end < 0 || fseek(img, pos, SEEK_SET) != 0)
+        return -1;
+    return end - pos;
+}
+
+static int image_record_payload_ok(uint32_t flen, uint32_t nlen, long remaining)
+{
+    uint64_t need;
+    if (remaining < 0)
+        return 0;
+    if (nlen > IMAGE_MAX_NAME_LEN)
+        return 0;
+    need = (uint64_t)SALT_SIZE + (uint64_t)nlen + (uint64_t)flen;
+    if (need > (uint64_t)remaining)
+        return 0;
+    return 1;
+}
+
+static int append_record(FILE* img, const char* name, uint32_t name_len,
+                         const uint8_t salt[SALT_SIZE], const uint8_t* data, uint32_t data_len)
+{
+    uint32_t flen = data_len;
+    if (name_len > IMAGE_MAX_NAME_LEN) {
+        fprintf(stderr, "file name too long\n");
+        return -1;
+    }
+    pthread_mutex_lock(&image_mutex);
+    if (fwrite(&flen, 4, 1, img) != 1 ||
+        fwrite(&name_len, 4, 1, img) != 1 ||
+        fwrite(salt, 1, SALT_SIZE, img) != SALT_SIZE ||
+        fwrite(name, 1, name_len, img) != name_len ||
+        fwrite(data, 1, data_len, img) != data_len) {
+        perror("fwrite image");
+        pthread_mutex_unlock(&image_mutex);
+        return -1;
+    }
+    fflush(img);
+    pthread_mutex_unlock(&image_mutex);
+    return 0;
+}
+
+static int collect_dir(const char* base_dir, const char* dir_path,
+                       image_file_t** items, int* count, int* cap)
+{
+    (void)base_dir;
+    DIR* d = opendir(dir_path);
+    if (!d) {
+        perror(dir_path);
+        return -1;
+    }
+    struct dirent* ent;
+    while ((ent = readdir(d)) != NULL) {
+        if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0)
+            continue;
+        char full[1024];
+        snprintf(full, sizeof(full), "%s/%s", dir_path, ent->d_name);
+        struct stat st;
+        if (stat(full, &st) != 0) {
+            perror(full);
+            continue;
+        }
+        if (S_ISDIR(st.st_mode)) {
+            if (collect_dir(base_dir, full, items, count, cap) != 0) {
+                closedir(d);
+                return -1;
+            }
+        } else if (S_ISREG(st.st_mode)) {
+            if (*count >= *cap) {
+                closedir(d);
+                fprintf(stderr, "too many files\n");
+                return -1;
+            }
+            (*items)[*count].disk_path = strdup(full);
+            (*items)[*count].image_name = strdup(full);
+            if (!(*items)[*count].disk_path || !(*items)[*count].image_name) {
+                closedir(d);
+                return -1;
+            }
+            (*count)++;
+        }
+    }
+    closedir(d);
+    return 0;
+}
+
+static int collect_arg(const char* arg, image_file_t** items, int* count, int* cap)
+{
+    struct stat st;
+    if (stat(arg, &st) != 0) {
+        perror(arg);
+        return -1;
+    }
+    if (S_ISDIR(st.st_mode)) {
+        char base[1024];
+        snprintf(base, sizeof(base), "%s", arg);
+        size_t len = strlen(base);
+        while (len > 1 && base[len - 1] == '/')
+            base[--len] = '\0';
+        return collect_dir(base, base, items, count, cap);
+    }
+    if (*count >= *cap)
+        return -1;
+    (*items)[*count].disk_path = strdup(arg);
+    (*items)[*count].image_name = strdup(arg);
+    if (!(*items)[*count].disk_path || !(*items)[*count].image_name)
+        return -1;
+    (*count)++;
+    return 0;
+}
+
+static int add_one_file_to_image(const char* disk_path, const char* image_name, FILE* img)
+{
+    size_t name_len = strlen(image_name);
+    if (name_len > IMAGE_MAX_NAME_LEN) {
+        fprintf(stderr, "file name too long: %s\n", image_name);
+        return -1;
+    }
+    FILE* fin = fopen(disk_path, "rb");
+    if (!fin) {
+        perror(disk_path);
+        return -1;
+    }
+    size_t sz = get_file_size(fin);
+    if (sz == 0) {
+        uint8_t salt[SALT_SIZE];
+        if (gen_salt(salt) != 0) {
+            fclose(fin);
+            return -1;
+        }
+        uint32_t nl = (uint32_t)strlen(image_name);
+        int r = append_record(img, image_name, nl, salt, (const uint8_t*)"", 0);
+        fclose(fin);
+        return r;
+    }
+    uint8_t* plain = malloc(sz);
+    uint8_t* cipher = malloc(sz);
+    if (!plain || !cipher) {
+        perror("malloc");
+        free(plain);
+        free(cipher);
+        fclose(fin);
+        return -1;
+    }
+    if (fread(plain, 1, sz, fin) != sz) {
+        perror("fread");
+        free(plain);
+        free(cipher);
+        fclose(fin);
+        return -1;
+    }
+    fclose(fin);
+    uint8_t salt[SALT_SIZE];
+    if (gen_salt(salt) != 0) {
+        free(plain);
+        free(cipher);
+        return -1;
+    }
+    rc4_crypt(salt, plain, cipher, sz);
+    uint32_t nl = (uint32_t)strlen(image_name);
+    int r = append_record(img, image_name, nl, salt, cipher, (uint32_t)sz);
+    free(plain);
+    free(cipher);
+    return r;
+}
+
+/*1=EOF, 0=norm, -1=err */
+static int read_image_record(FILE* img, uint32_t* flen, uint32_t* nlen,
+                             uint8_t salt[SALT_SIZE], char** name_out)
+{
+    long rem;
+    *name_out = NULL;
+    rem = image_file_remaining(img);
+    if (rem < 0)
+        return -1;
+    if (rem == 0)
+        return 1;
+    if (rem < 8)
+        return -1;
+    if (fread(flen, 4, 1, img) != 1)
+        return -1;
+    if (fread(nlen, 4, 1, img) != 1)
+        return -1;
+    rem = image_file_remaining(img);
+    if (rem < 0 || !image_record_payload_ok(*flen, *nlen, rem))
+        return -1;
+    if (fread(salt, 1, SALT_SIZE, img) != SALT_SIZE)
+        return -1;
+    if (*nlen == 0) {
+        *name_out = malloc(1);
+        if (!*name_out)
+            return -1;
+        (*name_out)[0] = '\0';
+        return 0;
+    }
+    *name_out = malloc((size_t)*nlen + 1);
+    if (!*name_out)
+        return -1;
+    if (fread(*name_out, 1, *nlen, img) != *nlen) {
+        free(*name_out);
+        *name_out = NULL;
+        return -1;
+    }
+    (*name_out)[*nlen] = '\0';
+    return 0;
+}
+
+static int cmp_list_entry(const void* a, const void* b)
+{
+    const list_entry_t* ea = (const list_entry_t*)a;
+    const list_entry_t* eb = (const list_entry_t*)b;
+    return strcmp(ea->name, eb->name);
+}
+
+static int cmd_add(int argc, char* argv[])
+{
+    const char* key = NULL;
+    const char* image_path = NULL;
+    int path_start = -1;
+    int i;
+    for (i = 2; i < argc; i++) {
+        if (strcmp(argv[i], "-key") == 0 && i + 1 < argc) {
+            key = argv[++i];
+        } else if (strcmp(argv[i], "-image") == 0 && i + 1 < argc) {
+            image_path = argv[++i];
+        } else if (path_start < 0) {
+            path_start = i;
+        }
+    }
+    if (!key || !image_path || path_start < 0) {
+        fprintf(stderr, "Usage: %s -add -key \"secret\" -image disk.img file1 ...\n", argv[0]);
+        return 1;
+    }
+    rc4_set_master_key(key, strlen(key));
+    image_file_t* items = calloc(IMAGE_MAX_FILES, sizeof(image_file_t));
+    if (!items) {
+        perror("calloc");
+        return 1;
+    }
+    int count = 0;
+    int cap = IMAGE_MAX_FILES;
+    for (i = path_start; i < argc; i++) {
+        if (collect_arg(argv[i], &items, &count, &cap) != 0) {
+            fprintf(stderr, "collect failed: %s\n", argv[i]);
+        }
+    }
+    if (count == 0) {
+        fprintf(stderr, "no files to add\n");
+        free(items);
+        return 1;
+    }
+    if (count > MAX_FILES) {
+        fprintf(stderr, "too many files (max %d)\n", MAX_FILES);
+        for (i = 0; i < count; i++) {
+            free(items[i].disk_path);
+            free(items[i].image_name);
+        }
+        free(items);
+        return 1;
+    }
+    FILE* img = fopen(image_path, "ab");
+    if (!img) {
+        perror(image_path);
+        for (i = 0; i < count; i++) {
+            free(items[i].disk_path);
+            free(items[i].image_name);
+        }
+        free(items);
+        return 1;
+    }
+    job_context_t job;
+    job.output_dir = NULL;
+    job.file_count = count;
+    job.current_index = 0;
+    job.completed_count = 0;
+    job.log_file = NULL;
+    job.key = 0;
+    job.stats = NULL;
+    job.image = img;
+    job.image_errors = 0;
+    job.worker_count = count < IMAGE_THREADS ? count : IMAGE_THREADS;
+    for (i = 0; i < count; i++) {
+        job.input_files[i] = items[i].disk_path;
+        job.image_names[i] = items[i].image_name;
+    }
+    pthread_mutex_init(&job.mutex, NULL);
+    process_parallel(&job);
+    pthread_mutex_destroy(&job.mutex);
+    fclose(img);
+    for (i = 0; i < count; i++) {
+        free(items[i].disk_path);
+        free(items[i].image_name);
+    }
+    free(items);
+    return job.image_errors ? 1 : 0;
+}
+
+static int cmd_list(int argc, char* argv[])
+{
+    const char* image_path = NULL;
+    int i;
+    for (i = 2; i < argc; i++) {
+        if (strcmp(argv[i], "-image") == 0 && i + 1 < argc)
+            image_path = argv[++i];
+    }
+    if (!image_path) {
+        fprintf(stderr, "Usage: %s -list -image disk.img\n", argv[0]);
+        return 1;
+    }
+    FILE* img = fopen(image_path, "rb");
+    if (!img) {
+        perror(image_path);
+        return 1;
+    }
+    list_entry_t* entries = NULL;
+    int n = 0;
+    int cap = 0;
+    for (;;) {
+        uint32_t flen, nlen;
+        uint8_t salt[SALT_SIZE];
+        char* name = NULL;
+        int rr = read_image_record(img, &flen, &nlen, salt, &name);
+        if (rr == 1)
+            break;
+        if (rr != 0 || !name) {
+            fprintf(stderr, "corrupt image\n");
+            free(name);
+            fclose(img);
+            return 1;
+        }
+        (void)salt;
+        if (fseek(img, (long)flen, SEEK_CUR) != 0) {
+            free(name);
+            fprintf(stderr, "corrupt image\n");
+            fclose(img);
+            return 1;
+        }
+        if (n >= cap) {
+            cap = cap ? cap * 2 : 16;
+            list_entry_t* ne = realloc(entries, cap * sizeof(list_entry_t));
+            if (!ne) {
+                free(name);
+                perror("realloc");
+                fclose(img);
+                return 1;
+            }
+            entries = ne;
+        }
+        entries[n].name = name;
+        entries[n].size = flen;
+        n++;
+    }
+    if (image_file_remaining(img) != 0) {
+        fprintf(stderr, "corrupt image\n");
+        for (i = 0; i < n; i++)
+            free(entries[i].name);
+        free(entries);
+        fclose(img);
+        return 1;
+    }
+    fclose(img);
+    if (n > 0)
+        qsort(entries, (size_t)n, sizeof(list_entry_t), cmp_list_entry);
+    for (i = 0; i < n; i++)
+        printf("%s %u\n", entries[i].name, entries[i].size);
+    for (i = 0; i < n; i++)
+        free(entries[i].name);
+    free(entries);
+    return 0;
+}
+
+static int cmd_get(int argc, char* argv[])
+{
+    const char* key = NULL;
+    const char* image_path = NULL;
+    const char* out_path = NULL;
+    const char* file_name = NULL;
+    int i;
+    for (i = 2; i < argc; i++) {
+        if (strcmp(argv[i], "-key") == 0 && i + 1 < argc)
+            key = argv[++i];
+        else if (strcmp(argv[i], "-image") == 0 && i + 1 < argc)
+            image_path = argv[++i];
+        else if (strcmp(argv[i], "-out") == 0 && i + 1 < argc)
+            out_path = argv[++i];
+        else if (!file_name)
+            file_name = argv[i];
+    }
+    if (!key || !image_path || !out_path || !file_name) {
+        fprintf(stderr, "Usage: %s -get -image disk.img -key \"secret\" -out out.txt /name\n", argv[0]);
+        return 1;
+    }
+    rc4_set_master_key(key, strlen(key));
+    FILE* img = fopen(image_path, "rb");
+    if (!img) {
+        perror(image_path);
+        return 1;
+    }
+    for (;;) {
+        uint32_t flen, nlen;
+        uint8_t salt[SALT_SIZE];
+        char* name = NULL;
+        int rr = read_image_record(img, &flen, &nlen, salt, &name);
+        if (rr == 1)
+            break;
+        if (rr != 0 || !name) {
+            fprintf(stderr, "corrupt image\n");
+            free(name);
+            fclose(img);
+            return 1;
+        }
+        if (strcmp(name, file_name) == 0) {
+            long rem = image_file_remaining(img);
+            if (rem < 0 || (uint64_t)flen > (uint64_t)rem) {
+                fprintf(stderr, "corrupt image\n");
+                free(name);
+                fclose(img);
+                return 1;
+            }
+            uint8_t* cipher = malloc(flen ? flen : 1);
+            uint8_t* plain = malloc(flen ? flen : 1);
+            if (!cipher || !plain) {
+                perror("malloc");
+                free(name);
+                free(cipher);
+                free(plain);
+                fclose(img);
+                return 1;
+            }
+            if (fread(cipher, 1, flen, img) != flen) {
+                fprintf(stderr, "corrupt image\n");
+                free(name);
+                free(cipher);
+                free(plain);
+                fclose(img);
+                return 1;
+            }
+            rc4_crypt(salt, cipher, plain, flen);
+            FILE* out = fopen(out_path, "wb");
+            if (!out) {
+                perror(out_path);
+                free(name);
+                free(cipher);
+                free(plain);
+                fclose(img);
+                return 1;
+            }
+            if (flen > 0 && fwrite(plain, 1, flen, out) != flen) {
+                perror("fwrite");
+                fclose(out);
+                free(name);
+                free(cipher);
+                free(plain);
+                fclose(img);
+                return 1;
+            }
+            fclose(out);
+            free(name);
+            free(cipher);
+            free(plain);
+            fclose(img);
+            return 0;
+        }
+        free(name);
+        if (fseek(img, (long)flen, SEEK_CUR) != 0) {
+            fprintf(stderr, "corrupt image\n");
+            fclose(img);
+            return 1;
+        }
+    }
+    fclose(img);
+    fprintf(stderr, "file not found in image: %s\n", file_name);
+    return 1;
+}
+
 int main(int argc, char* argv[])
 {
+    if (argc >= 2 && strcmp(argv[1], "-add") == 0)
+        return cmd_add(argc, argv);
+    if (argc >= 2 && strcmp(argv[1], "-list") == 0)
+        return cmd_list(argc, argv);
+    if (argc >= 2 && strcmp(argv[1], "-get") == 0)
+        return cmd_get(argc, argv);
+
     int mode = -1;
     int file_start_index = 1;
     
