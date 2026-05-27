@@ -6,9 +6,6 @@
 extern "C" {
 #endif
 
-void set_key(uint8_t key);
-void caesar(const void* src, void* dst, size_t len);
-
 void rc4_set_master_key(const char* key, size_t len);
 void rc4_crypt(const uint8_t salt[16], const void* src, void* dst, size_t len);
 
