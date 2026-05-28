@@ -1,5 +1,5 @@
 CC = gcc
-CFLAGS = -Wall -pthread -O2 -g
+CFLAGS = -Wall -pthread -O2 -g -D_FILE_OFFSET_BITS=64
 TARGET = secure_copy
 OBJS = secure_copy.o caesar.o
 
